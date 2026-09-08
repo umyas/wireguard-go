@@ -22,6 +22,8 @@ import (
 
 	"github.com/soypat/lneto"
 	"github.com/soypat/lneto/dns"
+	"github.com/soypat/lneto/tcp"
+	"github.com/soypat/lneto/tcp/rto"
 	"github.com/soypat/lneto/x/xnet"
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -51,13 +53,14 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 	// configured (mirrors gVisor's hasV4/hasV6).
 	var staticAddr4 [4]byte
 	var staticAddr6 [16]byte
+	hasIPV6 := false
 	for _, addr := range localAddresses {
 		if addr.Is4() && !dev.hasV4 {
 			staticAddr4 = addr.As4()
 			dev.hasV4 = true
-		} else if addr.Is6() && !dev.hasV6 {
+		} else if addr.Is6() && !hasIPV6 {
 			staticAddr6 = addr.As16()
-			dev.hasV6 = true
+			hasIPV6 = true
 		}
 	}
 
@@ -96,7 +99,7 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 		MaxActiveUDPPorts: 256,
 		DNSServer:         dnsServer,
 	}
-	if dev.hasV6 {
+	if hasIPV6 {
 		cfg.StaticAddress6 = staticAddr6
 		cfg.IPv6Stack = xnet.DefaultStack6()
 	}
@@ -136,12 +139,28 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 			EstablishedTimeout: 30 * time.Second,
 			ClosingTimeout:     10 * time.Second,
 			NewBackoff:         newTCPBackoff, // required: StackGo panics if nil.
+			NanoTime:           nanotime,
+			// Give each connection an adaptive RTO timer (RFC 6298 style) instead
+			// of the fixed-interval default, so retransmissions track the measured
+			// RTT rather than firing on a worst-case constant.
+			NewPolicy: func() tcp.Policy {
+				rto := new(rto.Timer)
+				rto.Configure(nanotime)
+				return rto
+			},
 		},
 		TCPDialTimeout: time.Second,
 		TCPDialRetries: 30,
 	})
 	dev.events <- tun.EventUp
 	return dev, &Net{stack: dev}, nil
+}
+
+// nanotime is the monotonic clock handed to the stack's TCP timers. It is only
+// ever used to measure elapsed time (RTT samples, RTO expiry), so the absolute
+// epoch is irrelevant.
+func nanotime() int64 {
+	return time.Now().UnixNano()
 }
 
 // lnetoStack is a lneto-backed userspace network stack that implements both
@@ -178,9 +197,9 @@ type lnetoStack struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 
-	mtu          int
-	dnsServers   []netip.Addr
-	hasV4, hasV6 bool
+	mtu        int
+	dnsServers []netip.Addr
+	hasV4      bool
 }
 
 type event struct{}
@@ -422,7 +441,7 @@ func dnsError(host string, err error) *net.DNSError {
 // A and AAAA are queried for the enabled families and, when IPv6 is enabled, IPv6
 // results are ordered first (no RFC 6724).
 func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]string, error) {
-	if host == "" || (!n.hasV4 && !n.hasV6) {
+	if host == "" || (!n.hasV4 && !n.sa.IsIPv6Enabled()) {
 		return nil, &net.DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound: true}
 	}
 	// Strip any IPv6 zone before attempting to parse a literal address.
@@ -456,7 +475,7 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 			addrsV4 = a
 		}
 	}
-	if n.hasV6 {
+	if n.sa.IsIPv6Enabled() {
 		if a, err := blk.DoLookupIPType(host, timeout, dns.TypeAAAA); err != nil {
 			if lastErr == nil {
 				lastErr = dnsError(host, err)
@@ -468,7 +487,7 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 
 	// IPv6 first when enabled, mirroring the gvisor Net's ordering.
 	var addrs []netip.Addr
-	if n.hasV6 {
+	if n.sa.IsIPv6Enabled() {
 		addrs = append(addrsV6, addrsV4...)
 	} else {
 		addrs = append(addrsV4, addrsV6...)
